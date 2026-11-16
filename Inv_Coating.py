@@ -1,28 +1,3 @@
-"""
-光学薄膜反演方法对比实验：ASMC vs Gaussian VA
-投稿版可视化与数值记录 (Joint-KDE + Zoom-in Insets)
-
-本版本按 Applied Optics 两位审稿人意见完成的修订版：
-- R2-1 / R2-minor-1 : 修复 TMM 反射率公式（入射介质导纳 + 斜入射基底导纳 +
-  显式偏振处理），通过裸基底菲涅尔极限自检；
-- R2-2 / R2-minor-2 : 删除 HfO2 / Ta2O5 的 Sellmeier 钳位与 ULD 表层
-  n_surface 钳位（原钳位使色散与孔隙率信息失效）；
-- R1-1 / R2-4       : 删除 632.8 nm 十倍波长加权，两法统一为同一标准
-  高斯似然（两角度平方和，含 1/sigma^2）；
-- R2-5 / R2-8       : Gaussian VA 改为逐样本 Monte-Carlo ELBO（数据项 +
-  对均匀盒先验的变换分布 KL），后验宽度随噪声水平变化；
-- R2-6              : ASMC 移动核加 Metropolis 接受步（对退火目标不变），
-  终估按最终权重重采样；线性退火改为按 ESS 目标的自适应退火；
-- R1-2 / R1-5       : 报告全部 11 个参数（含折射率漂移）、两角度光谱
-  RMSE、RMSE/sigma 与 2-sigma 覆盖率，主流程支持多种子统计；
-- R1-4              : 增加全协方差 Gaussian VA 变体与后验相关性分析；
-- R2-8              : 增加独立随机游走 Metropolis 参照解；
-- R1-3 / R1-6 / R2-7: 提供 ASMC 超参、VA 超参、起始值、孔隙率前向
-  敏感性分析工具；
-- 可复现性          : 噪声改在 CPU 端由固定种子流生成（跨设备一致），
-  运行时间统计加入 CUDA 同步。
-"""
-
 import argparse
 import math
 import numpy as np
@@ -74,7 +49,7 @@ class Config:
     # 噪声水平（核心可配置项）
     SIGMA_OBS: float = 1e-5
 
-    # 斜入射通道偏振 (R2-minor-1)：'s' = TE（原实现约定），'p' = TM，
+    # 斜入射通道偏振：'s' = TE，'p' = TM，
     # 'unpolarized' = 两偏振反射率平均
     POLARIZATION: str = 's'
 
@@ -100,7 +75,7 @@ class Config:
     # 潜变量 log_std 的数值下界。
     STD_LOG_MIN: float = -18.0
 
-    # 先验可行域（R2-3：两法共用的单一先验定义）
+    # 两种方法共用的均匀盒先验
     BOUNDS_D: Tuple[float, float] = (40.0, 150.0)    # 厚度 (nm)
     BOUNDS_DN: Tuple[float, float] = (-0.02, 0.02)   # 折射率漂移
     BOUNDS_F: Tuple[float, float] = (0.30, 0.50)     # 孔隙率
@@ -112,7 +87,7 @@ class Config:
     INIT_D_SCALE: float = 1.0         # 起始厚度相对设计值的缩放（起始值敏感性用）
     INIT_F_VALUE: float = None        # 起始孔隙率（None = TRUE_F_ULD）
 
-    # 独立参照 MCMC (R2-8)
+    # 独立参照 MCMC
     REF_MCMC_STEPS: int = 20000
     REF_MCMC_BURNIN: int = 5000
 
@@ -141,8 +116,7 @@ class PhysicsModel:
         self.device = torch.device(config.DEVICE)
 
     def sellmeier_sio2(self, wl_nm):
-        # R2-2: 仅保留数值保护下限（在 550-720 nm 内 n>=1.455，不激活），
-        # 不再对物理取值做区间钳位
+        # 折射率下限用于数值保护。
         wl = wl_nm * 1e-3
         B1, B2, B3 = 0.6961663, 0.4079426, 0.8974794
         C1, C2, C3 = 0.0684043 ** 2, 0.1162414 ** 2, 9.896161 ** 2
@@ -150,9 +124,6 @@ class PhysicsModel:
         return torch.sqrt(torch.clamp(n2, min=1.45 ** 2))
 
     def sellmeier_hfo2(self, wl_nm):
-        # R2-2: 删除原 [1.94, 1.96] 钳位。原 Sellmeier 系数在 550-720 nm
-        # 给出 n ~= 1.751，恒低于钳位下界，等于把色散替换为常数 1.94，
-        # 物理上自相矛盾
         wl = wl_nm * 1e-3
         B1, B2, B3 = 1.50, 0.55, 1.20
         C1, C2, C3 = 0.05 ** 2, 0.10 ** 2, 8.00 ** 2
@@ -160,7 +131,6 @@ class PhysicsModel:
         return torch.sqrt(n2)
 
     def sellmeier_ta2o5(self, wl_nm):
-        # R2-2: 删除原 [2.08, 2.12] 钳位（同上，原系数给出 n ~= 1.941）
         wl = wl_nm * 1e-3
         B1, B2, B3 = 2.13, 0.58, 1.54
         C1, C2, C3 = 0.062 ** 2, 0.16 ** 2, 13.73 ** 2
@@ -168,8 +138,7 @@ class PhysicsModel:
         return torch.sqrt(n2)
 
     def sellmeier_mgf2(self, wl_nm):
-        # R2-2: [1.37, 1.38] 在波段内不激活（n ~= 1.377-1.379），保留作为
-        # 数值保护
+        # 折射率区间 [1.37, 1.38] 用于数值保护。
         wl = wl_nm * 1e-3
         B1, B2 = 0.48755108, 0.39875031
         C1, C2 = 0.04338408 ** 2, 0.09461442 ** 2
@@ -184,17 +153,12 @@ class PhysicsModel:
         return torch.stack([n_sio2, n_hfo2, n_sio2, n_ta2o5, n_mgf2], dim=-1)
 
     def moth_eye_effective_n(self, n_uld, f, grad_strength=None):
-        """R2-minor-2: 多孔 ULD SiO2 层的有效折射率模型。
+        """计算多孔 ULD SiO2 层的有效折射率。
 
         Maxwell-Garnett 均匀球孔近似给出基底有效折射率 n_base，再经
         n_surface = 1.09 + (n_base - 1.09) * (1 - alpha^2.2) 映射到表层。
         该层在 TMM 中作为单一均匀层处理（折射率不随深度变化），蛾眼梯度
         仅由标量 alpha 概括。
-
-        原实现对 n_surface 施加的 [1.09, 1.10] 钳位已删除：该钳位在
-        f 属于先验 [0.30, 0.50] 的大半区间内饱和，使光谱对孔隙率几乎
-        完全不敏感（R1-6 / R2-minor-2），是原稿孔隙率误差居高不下的
-        主要模型原因。
         """
         if grad_strength is None:
             grad_strength = self.config.MOTH_EYE_GRAD_STRENGTH
@@ -208,11 +172,7 @@ class PhysicsModel:
         return n_surface
 
     def tmm_reflectance(self, d, dn, f, wl, theta_deg):
-        """R2-1 / R2-minor-1: 修正后的传输矩阵反射率算子。
-
-        原实现的 r = (m11 + m12*ns - m21/ns - m22) / (m11 + m12*ns + ...) 把
-        基底导纳放在了入射介质导纳的位置上：裸基底反射率恒为 0（应为
-        4.19%），理想增透反而反射 4.19%。修正为教科书形式
+        """用传输矩阵计算指定偏振下的反射率。
 
             r = (eta_0 * B - C) / (eta_0 * B + C),
             B = m11 + m12 * eta_s,  C = m21 + m22 * eta_s,
@@ -256,8 +216,8 @@ class PhysicsModel:
             cos_d = torch.cos(delta)
             sin_d = torch.sin(delta)
 
-            # R2-minor-1: 按偏振取特征导纳
-            #   s (TE): eta = n cos(theta)   —— 与原实现一致
+            # 按偏振取特征导纳
+            #   s (TE): eta = n cos(theta)
             #   p (TM): eta = n / cos(theta)
             eta_i = ni / cos_thetai if polarization == 'p' else ni * cos_thetai
             m11 = cos_d
@@ -346,13 +306,7 @@ class SMCMethod:
         self.lower, self.upper = config.parameter_box()
 
     def log_likelihood_batch(self, particles, R_obs_0, R_obs_30, wl):
-        """R1-1 / R2-4: 标准高斯对数似然。
-
-        删除了原实现中 632.8 nm 波长的十倍加权与 1/N 归一化：前者没有
-        统计依据（审稿人 1 第 1 条），后者把似然压低 N 倍、等效放大噪声
-        sqrt(N) 倍。两角度平方和除以 sigma^2，与 Gaussian VA 的数据项
-        完全一致（同一目标函数）。
-        """
+        """计算两角度的高斯对数似然，与 Gaussian VA 共用误差定义。"""
         particles_tensor = torch.tensor(particles, device=self.device, dtype=torch.float64)
         d = particles_tensor[:, :5]
         dn = particles_tensor[:, 5:10]
@@ -366,7 +320,7 @@ class SMCMethod:
         return ll.cpu().numpy()
 
     def in_bounds(self, particles):
-        """R2-3: 先验可行域（均匀盒）判定，与 Gaussian VA 共用 Config 定义。"""
+        """判断粒子是否位于均匀盒先验的范围内。"""
         return np.all((particles >= self.lower) & (particles <= self.upper), axis=-1)
 
     def _initial_particles(self, count):
@@ -387,7 +341,7 @@ class SMCMethod:
         return particles, log_prior - log_proposal
 
     def _sync_device(self):
-        # 运行时间统计需要同步异步 GPU 队列（审稿人对 runtime 的质疑）
+        # 计时前后同步 GPU 队列。
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
 
@@ -469,7 +423,7 @@ class SMCMethod:
             ll_current = ll_current[idx]
             logw.fill(0.0)
 
-            # --- R2-6: 逐坐标 Metropolis-Hastings 移动核 ---
+            # 逐坐标 Metropolis-Hastings 移动核
             mh_rate = coord_mh_sweep(self.config.MH_SWEEPS)
             acceptance_history.append(mh_rate)
 
@@ -483,7 +437,7 @@ class SMCMethod:
             mh_rate = coord_mh_sweep(self.config.FINAL_SWEEPS)
             acceptance_history.append(mh_rate)
 
-        # --- R2-6: 终估按最终权重重采样为等权后验样本 ---
+        # 按最终权重重采样，得到等权后验样本。
         w_final = np.exp(logw - logw.max())
         w_final /= w_final.sum()
         final_idx = np.random.choice(N, size=N, p=w_final)
@@ -611,11 +565,11 @@ class GaussianVAFullCov(GaussianVA):
 
 
 # ============================================================
-# 独立参照解 (R2-8)
+# 独立参照解
 # ============================================================
 
 class ReferenceMCMC:
-    """R2-8: 独立随机游走 Metropolis 参照采样器。
+    """独立随机游走 Metropolis 参照采样器。
 
     与两个被评估方法使用同一似然（SMCMethod.log_likelihood_batch）与
     同一有界均匀先验（拒绝越界提议）。单一长链，burn-in 期间按
@@ -701,7 +655,7 @@ class ReferenceMCMC:
 class Evaluator:
     @staticmethod
     def evaluate(particles: np.ndarray, true_params: Tuple, method_name: str) -> Dict:
-        """R2-9 / R1-2: 全部 11 个参数的误差与 2-sigma 覆盖率。"""
+        """计算 11 个参数的误差与经验覆盖率。"""
         true_d, true_dn, true_f = [p.cpu().numpy() if torch.is_tensor(p) else p for p in true_params]
         d_mean = particles[:, :5].mean(axis=0)
         d_std = particles[:, :5].std(axis=0)
@@ -713,7 +667,7 @@ class Evaluator:
         f_std = particles[:, 10].std()
         f_err = np.abs(f_mean - true_f) / true_f * 100
 
-        # R1-2: 经验 2-sigma 覆盖率（真值是否落在均值 +/- 2*std 内）
+        # 检查真值是否落在均值加减两倍标准差的区间内。
         d_covered = np.abs(d_mean - true_d) <= 2.0 * d_std
         f_covered = np.abs(f_mean - true_f) <= 2.0 * f_std
 
@@ -740,7 +694,7 @@ class Evaluator:
     @staticmethod
     def compute_spectral_rmse(particles: np.ndarray, physics: PhysicsModel, data: Dict,
                               n_samples: int = 200, seed: int = None) -> Dict:
-        """R2-9: 两角度光谱 RMSE（带种子的确定性子采样，可复现）。"""
+        """用可复现的子采样计算两角度光谱 RMSE。"""
         rng = np.random.default_rng(seed)
         idx = rng.choice(len(particles), min(n_samples, len(particles)), replace=False)
         ps = torch.tensor(particles[idx], device=physics.device, dtype=torch.float64)
@@ -763,8 +717,7 @@ class Evaluator:
         eval_smc = Evaluator.evaluate(res_smc['particles'], data['true_params'], 'ASMC')
         eval_pinn = Evaluator.evaluate(res_pinn['particles'], data['true_params'], 'Gaussian VA')
 
-        # R2-9: 用与被评估方法一致的物理模型计算两角度 RMSE（原实现新建
-        # 了默认 Config 的 PhysicsModel，噪声水平与当前实验不符）
+        # 优先使用本次实验的前向模型计算两角度 RMSE。
         if physics is None:
             physics = PhysicsModel(Config())
         rmse_smc = Evaluator.compute_spectral_rmse(res_smc['particles'], physics, data, seed=seed)
@@ -855,16 +808,11 @@ class Evaluator:
 
 
 # ============================================================
-# 审稿人回应分析工具
+# 模型验证与敏感性分析
 # ============================================================
 
 def validate_forward_model(sigma: float = 1e-4, seed: int = 2024) -> Dict:
-    """R2-1: 前向算子物理自检。
-
-    把全部厚度置零，TMM 必须退化为裸基底的单界面菲涅尔反射率。
-    原实现（基底导纳放在入射介质位置）给出 R=0，本实现应与解析值
-    在 1e-6 内一致。
-    """
+    """比较零膜厚下的 TMM 反射率和裸基底菲涅尔解析值。"""
     config = Config()
     config.SIGMA_OBS = sigma
     physics = PhysicsModel(config)
@@ -906,7 +854,7 @@ def validate_forward_model(sigma: float = 1e-4, seed: int = 2024) -> Dict:
 
 
 def print_prior_specification(config: Config = None):
-    """R2-3: 先验与起始值的显式说明（区分二者，确认两法共用）。"""
+    """显示共用的均匀盒先验和设计中心。"""
     cfg = config or Config()
     print("=" * 80)
     print("R2-3 先验规范与起始值")
@@ -924,7 +872,7 @@ def print_prior_specification(config: Config = None):
 
 
 def analyze_posterior_correlations(particles: np.ndarray) -> Dict:
-    """R1-4: 后验相关性定量分析。"""
+    """计算参数间的后验相关性。"""
     x = np.asarray(particles, dtype=np.float64)
     with np.errstate(invalid='ignore'):
         corr = np.nan_to_num(np.asarray(np.corrcoef(x, rowvar=False)))
@@ -940,11 +888,11 @@ def analyze_posterior_correlations(particles: np.ndarray) -> Dict:
 
 
 def porosity_forward_sensitivity(sigma: float = 1e-4, seed: int = 2024, n_grid: int = 41):
-    """R1-6: 孔隙率前向敏感性分析。
+    """孔隙率前向敏感性分析。
 
     固定其余参数为真值，扫描 f 遍历整个先验 [0.30, 0.50]，给出两角度
-    光谱相对真值谱的最大 RMSE 与 n_surface(f) 的变化范围，以及"光谱
-    变化低于噪声 sigma 因而对 f 不可分辨"的区间宽度。
+    光谱相对真值谱的最大 RMSE、n_surface(f) 的变化范围，以及
+    光谱 RMSE 不超过观测噪声标准差的孔隙率区间宽度。
     """
     config = Config()
     config.SIGMA_OBS = sigma
@@ -1015,7 +963,7 @@ def run_single_trial(sigma, seed, va_class=GaussianVA, **overrides) -> Dict:
 
 
 def print_seed_statistics(trials: List[Dict]):
-    """R1-5: 多种子汇总（均值 ± 标准差）。"""
+    """按噪声水平汇总多种子的均值和标准差。"""
     print("\n" + "=" * 96)
     n_seeds = len({t['seed'] for t in trials})
     print(f"R1-5 多种子统计 (每噪声水平 {n_seeds} 个独立噪声实现)")
@@ -1045,7 +993,7 @@ def print_seed_statistics(trials: List[Dict]):
 
 
 def sensitivity_asmc_settings(sigma: float = 5e-3, seed: int = 2024, **cheap):
-    """R1-3: ASMC 数值配置敏感性（粒子数/级数上限/ESS阈值/提议尺度）。"""
+    """比较 ASMC 的粒子数、退火级数上限、ESS 阈值和提议尺度。"""
     grid = [
         ('基准配置', {}),
         ('粒子数 1000', {'N_PARTICLES_SMC': 1000}),
@@ -1082,7 +1030,7 @@ def sensitivity_asmc_settings(sigma: float = 5e-3, seed: int = 2024, **cheap):
 
 
 def sensitivity_va_settings(sigma: float = 5e-3, seed: int = 2024, **cheap):
-    """R2-8: Gaussian VA 设置敏感性（解释宽度为何/如何随噪声变化）。"""
+    """比较 Gaussian VA 的 KL 权重和优化设置。"""
     grid = [
         ('基准配置', {}),
         ('KL 权重 0（无正则）', {'KL_WEIGHT': 0.0}),
@@ -1149,7 +1097,7 @@ def sensitivity_starting_values(sigma: float = 1e-4, seed: int = 2024, *,
 
 
 def compare_with_reference(sigma: float = 1e-4, seed: int = 2024, **cheap):
-    """R2-8: 两个近似方法 vs 独立 Metropolis 参照解。"""
+    """将两种近似方法与独立 Metropolis 参照解比较。"""
     config = Config()
     config.SIGMA_OBS = sigma
     for k, v in cheap.items():
@@ -1177,7 +1125,7 @@ def compare_with_reference(sigma: float = 1e-4, seed: int = 2024, **cheap):
 
 
 def compare_covariance_family(sigma: float = 1e-4, seed: int = 2024, **cheap):
-    """R1-4: 对角 vs 全协方差 Gaussian VA 对比。"""
+    """比较 Gaussian VA 的对角和全协方差近似。"""
     config = Config()
     config.SIGMA_OBS = sigma
     for k, v in cheap.items():
@@ -1266,11 +1214,7 @@ class ManuscriptPlotter:
                 fontsize=14, fontweight='bold', va='bottom', ha='left', color='black')
 
     def plot_spectral_ab_test(self, data, res_smc, res_pinn, physics, sigma):
-        """
-        图1: 光谱拟合深度分析 (Double-Decker Layout with Zoom-Lens)
-        R2-minor-3: 放大插图补数值刻度；置信带图例明确说明只含模型后验
-        散布、不含观测噪声。
-        """
+        """绘制光谱拟合、残差和局部放大图。阴影带表示后验预测的光谱散布。"""
         wl = data['wavelengths'].cpu().numpy()
         R_obs = data['R_obs'][0].cpu().numpy()
 
@@ -1310,7 +1254,6 @@ class ManuscriptPlotter:
         axins_l.fill_between(wl[zoom_mask], (mu_smc - 2 * std_smc)[zoom_mask], (mu_smc + 2 * std_smc)[zoom_mask],
                              color=self.colors['smc_l'], alpha=0.6)
         axins_l.scatter(wl[zoom_mask], R_obs[zoom_mask], color=self.colors['obs'], s=20, alpha=0.6)
-        # R2-minor-3: 插图显示数值刻度（原图无刻度）
         axins_l.tick_params(labelsize=7)
         axins_l.locator_params(nbins=4)
         for spine in axins_l.spines.values():
@@ -1348,7 +1291,6 @@ class ManuscriptPlotter:
         axins_r.fill_between(wl[zoom_mask], (mu_pinn - 2 * std_pinn)[zoom_mask], (mu_pinn + 2 * std_pinn)[zoom_mask],
                              color=self.colors['pinn_l'], alpha=0.6)
         axins_r.scatter(wl[zoom_mask], R_obs[zoom_mask], color=self.colors['obs'], s=20, alpha=0.6)
-        # R2-minor-3: 插图显示数值刻度
         axins_r.tick_params(labelsize=7)
         axins_r.locator_params(nbins=4)
         for spine in axins_r.spines.values():
@@ -1541,7 +1483,7 @@ class ManuscriptPlotter:
 
 def run_noise_level_comparison(noise_levels: List[float] = [1e-4, 5e-3],
                                seeds: List[int] = [2024, 2025, 2026]):
-    """R1-5: 每个噪声水平在多个独立种子下重复，报告均值±标准差。
+    """每个噪声水平在多个独立种子下重复，报告均值和标准差。
 
     光谱和联合分布图使用每档噪声的最后一个种子。汇总图使用各档噪声的多种子均值。
     最高噪声档的第一个种子做完整初始化对照，其余种子只重复孔隙率偏置。
